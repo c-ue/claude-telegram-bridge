@@ -2,13 +2,16 @@
 """Claude Code Telegram Bot — receive instructions via Telegram, execute with Claude Code."""
 
 import asyncio
+import json
 import logging
 import os
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import yaml
 from telegram import Update
+from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -31,6 +34,7 @@ def load_config() -> dict:
 CFG = load_config()
 BOT_TOKEN = CFG["telegram"]["bot_token"]
 ALLOWED_IDS: set[int] = set(CFG["telegram"]["allowed_user_ids"])
+API_BASE_URL: str = CFG["telegram"].get("api_base_url", "https://api.telegram.org/bot")
 CLAUDE_CLI = CFG["claude"].get("cli_path", "claude")
 DEFAULT_CWD = Path(CFG["claude"].get("default_cwd", str(Path.home())))
 TIMEOUT = CFG["claude"].get("timeout_seconds", 300)
@@ -40,6 +44,7 @@ MEMPALACE_ENABLED: bool = CFG.get("mempalace", {}).get("enabled", False)
 MEMPALACE_MCP_CFG = CFG.get("mempalace", {}).get("mcp_config", "")
 LOG_LEVEL = CFG.get("logging", {}).get("level", "INFO")
 LOG_FILE = CFG.get("logging", {}).get("file", "")
+CHAT_LOG_FILE = CFG.get("logging", {}).get("chat_log", "")
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -95,16 +100,38 @@ def chunk_message(text: str, limit: int = TELEGRAM_MSG_LIMIT) -> list[str]:
     return chunks
 
 
+def log_chat(user_id: int, username: str | None, prompt: str, response: str) -> None:
+    """Append a conversation entry to the chat log file (JSONL format)."""
+    if not CHAT_LOG_FILE:
+        return
+    entry = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "user_id": user_id,
+        "username": username,
+        "prompt": prompt,
+        "response": response,
+    }
+    path = os.path.expanduser(CHAT_LOG_FILE)
+    try:
+        with open(path, "a") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except OSError as e:
+        logger.error("Failed to write chat log: %s", e)
+
+
+SOUL_FILE = Path(__file__).parent / "soul.md"
+
+
 def build_claude_cmd(prompt: str, *, continue_session: bool = True) -> list[str]:
     """Build the claude CLI command list."""
     cmd = [CLAUDE_CLI, "-p"]
     if continue_session and USE_SAME_SESSION:
         cmd.append("--continue")
     cmd.extend(EXTRA_ARGS)
-    if MEMPALACE_ENABLED and MEMPALACE_MCP_CFG:
-        mcp_path = Path(__file__).parent / MEMPALACE_MCP_CFG
-        if mcp_path.exists():
-            cmd.extend(["--mcp-config", str(mcp_path)])
+    # Soul: inject personality and skills via system prompt file
+    if SOUL_FILE.exists():
+        cmd.extend(["--append-system-prompt-file", str(SOUL_FILE)])
+    # MemPalace is registered as a user-level MCP server — no --mcp-config needed
     cmd.append(prompt)
     return cmd
 
@@ -189,14 +216,14 @@ async def cmd_timeout(update: Update, context) -> None:
 
 
 async def cmd_session_new(update: Update, context) -> None:
-    """Execute the next prompt without --continue to start a fresh session."""
+    """Start a fresh session immediately with an optional prompt."""
     if not is_authorized(update.effective_user.id):
         return
+    prompt = " ".join(context.args) if context.args else "Hello, I'm starting a new session. Introduce yourself briefly."
+    # Fake an update with this prompt and force new session
     context.user_data["new_session"] = True
-    await update.message.reply_text(
-        "Next message will start a new session.\n"
-        "Send your prompt now."
-    )
+    update.message.text = prompt
+    await handle_message(update, context)
 
 
 async def cmd_cancel(update: Update, _) -> None:
@@ -242,11 +269,22 @@ async def handle_message(update: Update, context) -> None:
     # Check for new session flag
     new_session = context.user_data.pop("new_session", False)
 
-    # Send thinking indicator
-    thinking_msg = await update.message.reply_text("Thinking...")
+    # Show typing indicator while processing
+    chat = update.message.chat
+
+    async def keep_typing():
+        """Send typing action every 5s to keep the indicator alive."""
+        while True:
+            try:
+                await chat.send_action(ChatAction.TYPING)
+            except Exception:
+                pass
+            await asyncio.sleep(5)
 
     cmd = build_claude_cmd(prompt, continue_session=not new_session)
     logger.info("Executing: %s", " ".join(cmd[:5]) + " ...")
+
+    typing_task = asyncio.create_task(keep_typing())
 
     try:
         running_proc = await asyncio.create_subprocess_exec(
@@ -267,12 +305,40 @@ async def handle_message(update: Update, context) -> None:
             if running_proc.returncode is None:
                 running_proc.kill()
             running_proc = None
-            await thinking_msg.edit_text(f"Command timed out after {current_timeout}s. Use /timeout to increase.")
+            typing_task.cancel()
+            await update.message.reply_text(f"Command timed out after {current_timeout}s. Use /timeout to increase.")
             return
 
         running_proc = None
+        typing_task.cancel()
         output = stdout.decode("utf-8", errors="replace").strip()
         err_output = stderr.decode("utf-8", errors="replace").strip()
+
+        # If --continue produced empty output, retry without it (new session)
+        if not output and not new_session and USE_SAME_SESSION:
+            logger.warning("Empty output with --continue, retrying as new session...")
+            typing_task = asyncio.create_task(keep_typing())
+            retry_cmd = build_claude_cmd(prompt, continue_session=False)
+            running_proc = await asyncio.create_subprocess_exec(
+                *retry_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=str(current_cwd),
+            )
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    running_proc.communicate(), timeout=current_timeout,
+                )
+            except asyncio.TimeoutError:
+                running_proc.terminate()
+                running_proc = None
+                typing_task.cancel()
+                await update.message.reply_text(f"Command timed out after {current_timeout}s.")
+                return
+            running_proc = None
+            typing_task.cancel()
+            output = stdout.decode("utf-8", errors="replace").strip()
+            err_output = stderr.decode("utf-8", errors="replace").strip()
 
         if not output and err_output:
             output = f"[stderr]\n{err_output}"
@@ -281,27 +347,17 @@ async def handle_message(update: Update, context) -> None:
 
         # Send response in chunks
         chunks = chunk_message(output)
-
-        # Edit the thinking message with first chunk
-        try:
-            await thinking_msg.edit_text(chunks[0])
-        except Exception:
-            # If edit fails (e.g., message too old), send as new
-            await update.message.reply_text(chunks[0])
-
-        # Send remaining chunks
-        for chunk in chunks[1:]:
+        for chunk in chunks:
             await update.message.reply_text(chunk)
 
         logger.info("Response sent (%d chars, %d chunks)", len(output), len(chunks))
+        log_chat(user.id, user.username, prompt, output)
 
     except Exception as e:
         running_proc = None
+        typing_task.cancel()
         logger.exception("Error executing Claude command")
-        try:
-            await thinking_msg.edit_text(f"Error: {e}")
-        except Exception:
-            await update.message.reply_text(f"Error: {e}")
+        await update.message.reply_text(f"Error: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -316,7 +372,13 @@ def main() -> None:
     logger.info("MemPalace: %s", "enabled" if MEMPALACE_ENABLED else "disabled")
     logger.info("Session mode: %s", "continue" if USE_SAME_SESSION else "new")
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    builder = Application.builder().token(BOT_TOKEN)
+    if API_BASE_URL != "https://api.telegram.org/bot":
+        logger.info("Using custom API base URL: %s", API_BASE_URL)
+        builder = builder.base_url(API_BASE_URL).base_file_url(
+            API_BASE_URL.replace("/bot", "/file/bot")
+        )
+    app = builder.build()
 
     # Register handlers
     app.add_handler(CommandHandler("start", cmd_start))

@@ -18,3 +18,4 @@ mempalace:
 logging:
   level: "INFO"
   file: "/home/user/claude-telegram-bot/bot.log"
+  chat_log: "/home/user/claude-telegram-bot/chat.jsonl"

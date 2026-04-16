@@ -1,7 +1,7 @@
 {
   "mcpServers": {
     "mempalace": {
-      "command": "python3",
+      "command": "/home/jessecichen/claude-telegram-bot/venv/bin/python3",
       "args": ["-m", "mempalace.mcp_server"]
     }
   }
