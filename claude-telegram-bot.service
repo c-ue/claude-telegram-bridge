@@ -1,0 +1,19 @@
+[Unit]
+Description=Claude Code Telegram Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=%i
+WorkingDirectory=/home/%i/claude-telegram-bot
+ExecStart=/home/%i/claude-telegram-bot/venv/bin/python3 /home/%i/claude-telegram-bot/bot.py
+Restart=always
+RestartSec=10
+StandardOutput=append:/home/%i/claude-telegram-bot/bot.log
+StandardError=append:/home/%i/claude-telegram-bot/bot.log
+Environment=PATH=/home/%i/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=HOME=/home/%i
+
+[Install]
+WantedBy=multi-user.target

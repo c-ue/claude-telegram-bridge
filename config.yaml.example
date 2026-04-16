@@ -1,0 +1,20 @@
+telegram:
+  bot_token: "YOUR_BOT_TOKEN_HERE"
+  allowed_user_ids:
+    - 123456789  # Your Telegram user ID
+
+claude:
+  cli_path: "claude"              # Path to claude CLI binary
+  default_cwd: "/home/user"       # Default working directory
+  timeout_seconds: 300            # Max execution time per command
+  extra_args:
+    - "--dangerously-skip-permissions"
+  use_same_session: true          # Use --continue to maintain session
+
+mempalace:
+  enabled: true                   # Enable MemPalace long-term memory
+  mcp_config: "mempalace-mcp.json"
+
+logging:
+  level: "INFO"
+  file: "/home/user/claude-telegram-bot/bot.log"
